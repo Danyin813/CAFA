@@ -39,7 +39,6 @@ from utils.utils import inference_results
 from utils.utils import get_current_consistency_weight
 
 import warnings
-import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 
 def init_project(cfg):
@@ -131,11 +130,11 @@ def build_model(cfg, writer):
     device = torch.device('cuda:0')
     model = CoDetectionCNN(n_channels=cfg.MODEL.input_nc,
                            n_classes=cfg.MODEL.output_nc).to(device)
-    ckpt = '/braindat/lab/yd/august/expriments/DA-ISC_0211/models/2023-02-22--09-01-25_lucchi_subset2_fa3/model-012000.ckpt'
-    checkpoint = torch.load(ckpt)
-    # new_state_dict = OrderedDict()
-    # state_dict = checkpoint['model_weights']
-    model.load_state_dict(checkpoint['model_weights'])
+    # ckpt = '/braindat/lab/yd/august/expriments/DA-ISC_0211/models/2023-02-22--09-01-25_lucchi_subset2_fa3/model-012000.ckpt'
+    # checkpoint = torch.load(ckpt)
+    # # new_state_dict = OrderedDict()
+    # # state_dict = checkpoint['model_weights']
+    # model.load_state_dict(checkpoint['model_weights'])
     cuda_count = torch.cuda.device_count()
     if cuda_count > 1:
         if cfg.TRAIN.batch_size % cuda_count == 0:
@@ -247,51 +246,6 @@ def feature_alignment(fea_src, fea_tgt, gt_src, threshold=0.7):
 
     return var_loss, dist_loss, align_loss, seg_tgt
 
-def meta_data(source_images, source_feature, target_feature, target_pseudo, source_gt):
-    target_pseudo = torch.argmax(target_pseudo, dim=1)
-    fea_src = F.normalize(source_feature, p=2, dim=1)  # L2 norm
-    fea_tgt = F.normalize(target_feature, p=2, dim=1)  # L2 norm
-    feature_dim = fea_src.shape[1]
-
-    assert fea_tgt.shape[0] == target_pseudo.shape[0]
-
-    # discriminative loss used for source domain
-    num_classes = 2  # two classes
-    proto = []
-    fea_tgt = fea_tgt.permute(0, 2, 3, 1)
-    for k in range(num_classes):
-        mask_k = target_pseudo == k
-        emb_k = fea_tgt[mask_k, :]
-        num = emb_k.shape[0]
-        if num == 0: continue
-
-        proto_k = l2_normalize(torch.mean(emb_k, dim=0))
-        proto.append(proto_k)
-
-    proto = torch.stack(proto)   ##target 的类中心
-    if proto.shape[0] == 2:
-        dist_loss = torch.sum(proto[0] * proto[1]).pow(2)
-
-        # alignment
-        b, c, h, w = fea_src.shape
-        fea_src_emb = fea_src.permute(0, 2, 3, 1)
-        fea_src_emb = torch.reshape(fea_src_emb, (-1, feature_dim))
-        fea_src_emb = l2_normalize(fea_src_emb)
-        proto = l2_normalize(proto)
-        seg_src = torch.einsum('nd,md->nm', fea_src_emb, proto)
-
-    else:
-        dist_loss = 0.0
-        align_loss = 0.0
-        seg_tgt = None
-    mask_source = seg_src.reshape(b, h, w, 2)
-    mask_source[mask_source < 0.7] = 0
-    mask_source[mask_source >= 0.7] = 1
-    mask = mask_source[:, :, :, 0] * (1 - source_gt)
-    mask += mask_source[:, :, :, 1] * source_gt
-
-    return mask
-
 
 def loop(cfg, train_provider, valid_provider, model, optimizer, iters, writer):
     f_loss_txt = open(os.path.join(cfg.record_path, 'loss.txt'), 'a')
@@ -341,7 +295,7 @@ def loop(cfg, train_provider, valid_provider, model, optimizer, iters, writer):
         
         # train with source
         _, batch = trainloader_iter.__next__()
-        cimg_source, clabel_source, aimg_source, alabel_source, dlabel_source, name = batch
+        cimg_source, clabel_source, aimg_source, alabel_source, dlabel_source = batch
         cimg_source = cimg_source.to(device)
         aimg_source = aimg_source.to(device)
         clabel_source = clabel_source.to(device)
@@ -357,202 +311,201 @@ def loop(cfg, train_provider, valid_provider, model, optimizer, iters, writer):
 
         img_source_cat = torch.cat([cimg_source, aimg_source], dim=1)
         img_tatget_aug_cat = torch.cat([cimg_target_aug, aimg_target_aug], dim=1)
-        img_target_cat = torch.cat([cimg_target, aimg_target], dim=1)
         cpred_source, apred_source, dpred_source, fea_source_c, fea_source_a, fea_source_d = model(img_source_cat)
         cpred_target_aug, apred_target_aug, dpred_target_aug, fea_tatget_aug_c, fea_tatget_aug_a, fea_tatget_aug_d = model(img_tatget_aug_cat)
 
+        loss_cpred = criterion_seg(cpred_source, clabel_source.long())
+        loss_apred = criterion_seg(apred_source, alabel_source.long())
+        loss_diff = criterion_seg(dpred_source, dlabel_source.long())
+
+        loss_total = loss_cpred + loss_apred + loss_diff
+        sum_loss_supervised += loss_total.item()
+
+        # train with target
+        img_target_cat = torch.cat([cimg_target, aimg_target], dim=1)
         with torch.no_grad():
             cpred_target, apred_target, dpred_target, fea_tatget_c, fea_tatget_a, fea_tatget_d = model(img_target_cat)
+            cpred_target_pl = torch.argmax(cpred_target, dim=1).long()
+            apred_target_pl = torch.argmax(apred_target, dim=1).long()
+            dpred_target_pl = torch.argmax(dpred_target, dim=1).long()
 
-## 计算target的类中心，用target的类中心作为meta data约束的点
+        if cfg.TRAIN.consistency_weight_rampup:
+            weight_fa = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_fa, consistency_rampup=cfg.TRAIN.rampup_iters)
+            weight_proto_pred = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_proto_pred, consistency_rampup=cfg.TRAIN.rampup_iters)
+            weight_consist_fea = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_consist_fea, consistency_rampup=cfg.TRAIN.rampup_iters)
+            weight_consist_pl = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_consist_pl, consistency_rampup=cfg.TRAIN.rampup_iters)
+            weight_warp = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_warp, consistency_rampup=cfg.TRAIN.rampup_iters)
+        else:
+            weight_fa = cfg.TRAIN.weight_fa
+            weight_proto_pred = cfg.TRAIN.weight_proto_pred
+            weight_consist_fea = cfg.TRAIN.weight_consist_fea
+            weight_consist_pl = cfg.TRAIN.weight_consist_pl
+            weight_warp = cfg.TRAIN.weight_warp
 
-        mask_source = meta_data(cimg_source, fea_source_c, fea_tatget_c, cpred_target, clabel_source)
-        # plt.imshow(mask_source[0].cpu(), cmap='gray')
-        cat = torch.cat((cimg_source[0,0].cpu(), mask_source[0].cpu().detach()), dim=1)
-        plt.imsave('/braindat/lab/yd/august/meta-diffusion/stage1/meta_mask/%d.png' % name, cat, cmap='gray')
+        # feature alignment loss
+        if cfg.TRAIN.feature_align:
+            loss_var_c, loss_dist_c, loss_aglin_c, proto_pred_c = feature_alignment(fea_source_c, fea_tatget_aug_c, clabel_source.long(), threshold=cfg.TRAIN.threshold)
+            loss_var_a, loss_dist_a, loss_aglin_a, proto_pred_a = feature_alignment(fea_source_a, fea_tatget_aug_a, alabel_source.long(), threshold=cfg.TRAIN.threshold)
+            loss_var_d, loss_dist_d, loss_aglin_d, proto_pred_d = feature_alignment(fea_source_d, fea_tatget_aug_d, dlabel_source.long(), threshold=cfg.TRAIN.threshold)
+            loss_fa = (loss_var_c + loss_var_a + loss_var_d) / 3.0 + \
+                      (loss_dist_c + loss_dist_a + loss_dist_d) / 3.0 + \
+                      (loss_aglin_c + loss_aglin_a + loss_aglin_d) / 3.0
+            loss_fa = loss_fa * weight_fa
+            loss_total += loss_fa
+            sum_loss_fa += loss_fa.item()
 
+        # prototype mask loss
+        if cfg.TRAIN.proto_pred_loss:
+            if proto_pred_c is None or proto_pred_a is None or proto_pred_d is None:
+                sum_loss_proto_pred = 0.0
+            else:
+                loss_proto_pred = criterion_seg(proto_pred_c, cpred_target_pl) / 3.0 + \
+                                criterion_seg(proto_pred_a, apred_target_pl) / 3.0 + \
+                                criterion_seg(proto_pred_d, dpred_target_pl) / 3.0
+                loss_proto_pred = loss_proto_pred * weight_proto_pred
+                loss_total += loss_proto_pred
+                sum_loss_proto_pred += loss_proto_pred.item()
+        else:
+            sum_loss_proto_pred = 0.0
 
-    #     loss_cpred = criterion_seg(cpred_source, clabel_source.long())
-    #     loss_apred = criterion_seg(apred_source, alabel_source.long())
-    #     loss_diff = criterion_seg(dpred_source, dlabel_source.long())
-    #
-    #     loss_total = loss_cpred + loss_apred + loss_diff
-    #     sum_loss_supervised += loss_total.item()
-    #
-    #     # train with target
-    #     img_target_cat = torch.cat([cimg_target, aimg_target], dim=1)
-    #     with torch.no_grad():
-    #         cpred_target, apred_target, dpred_target, fea_tatget_c, fea_tatget_a, fea_tatget_d = model(img_target_cat)
-    #         cpred_target_pl = torch.argmax(cpred_target, dim=1).long()
-    #         apred_target_pl = torch.argmax(apred_target, dim=1).long()
-    #         dpred_target_pl = torch.argmax(dpred_target, dim=1).long()
-    #
-    #     if cfg.TRAIN.consistency_weight_rampup:
-    #         weight_fa = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_fa, consistency_rampup=cfg.TRAIN.rampup_iters)
-    #         weight_proto_pred = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_proto_pred, consistency_rampup=cfg.TRAIN.rampup_iters)
-    #         weight_consist_fea = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_consist_fea, consistency_rampup=cfg.TRAIN.rampup_iters)
-    #         weight_consist_pl = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_consist_pl, consistency_rampup=cfg.TRAIN.rampup_iters)
-    #         weight_warp = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_warp, consistency_rampup=cfg.TRAIN.rampup_iters)
-    #     else:
-    #         weight_fa = cfg.TRAIN.weight_fa
-    #         weight_proto_pred = cfg.TRAIN.weight_proto_pred
-    #         weight_consist_fea = cfg.TRAIN.weight_consist_fea
-    #         weight_consist_pl = cfg.TRAIN.weight_consist_pl
-    #         weight_warp = cfg.TRAIN.weight_warp
-    #
-    #     # feature alignment loss
-    #     if cfg.TRAIN.feature_align:
-    #         loss_var_c, loss_dist_c, loss_aglin_c, proto_pred_c = feature_alignment(fea_source_c, fea_tatget_aug_c, clabel_source.long(), threshold=cfg.TRAIN.threshold)
-    #         loss_var_a, loss_dist_a, loss_aglin_a, proto_pred_a = feature_alignment(fea_source_a, fea_tatget_aug_a, alabel_source.long(), threshold=cfg.TRAIN.threshold)
-    #         loss_var_d, loss_dist_d, loss_aglin_d, proto_pred_d = feature_alignment(fea_source_d, fea_tatget_aug_d, dlabel_source.long(), threshold=cfg.TRAIN.threshold)
-    #         loss_fa = (loss_var_c + loss_var_a + loss_var_d) / 3.0 + \
-    #                   (loss_dist_c + loss_dist_a + loss_dist_d) / 3.0 + \
-    #                   (loss_aglin_c + loss_aglin_a + loss_aglin_d) / 3.0
-    #         loss_fa = loss_fa * weight_fa
-    #         loss_total += loss_fa
-    #         sum_loss_fa += loss_fa.item()
-    #
-    #     # prototype mask loss
-    #     if cfg.TRAIN.proto_pred_loss:
-    #         if proto_pred_c is None or proto_pred_a is None or proto_pred_d is None:
-    #             sum_loss_proto_pred = 0.0
-    #         else:
-    #             loss_proto_pred = criterion_seg(proto_pred_c, cpred_target_pl) / 3.0 + \
-    #                             criterion_seg(proto_pred_a, apred_target_pl) / 3.0 + \
-    #                             criterion_seg(proto_pred_d, dpred_target_pl) / 3.0
-    #             loss_proto_pred = loss_proto_pred * weight_proto_pred
-    #             loss_total += loss_proto_pred
-    #             sum_loss_proto_pred += loss_proto_pred.item()
-    #     else:
-    #         sum_loss_proto_pred = 0.0
-    #
-    #     # consistent feature loss
-    #     if cfg.TRAIN.consist_fea_loss:
-    #         loss_consist_fea = criterion_con(fea_tatget_aug_c, fea_tatget_c) / 3.0 + \
-    #                         criterion_con(fea_tatget_aug_a, fea_tatget_a) / 3.0 + \
-    #                         criterion_con(fea_tatget_aug_d, fea_tatget_d) / 3.0
-    #         loss_consist_fea = loss_consist_fea * weight_consist_fea
-    #         loss_total += loss_consist_fea
-    #         sum_loss_consist_fea += loss_consist_fea.item()
-    #     else:
-    #         sum_loss_consist_fea = 0.0
-    #
-    #     # consistent pseudo label loss
-    #     if cfg.TRAIN.consist_pl_loss:
-    #         loss_consist_pl = criterion_seg(cpred_target_aug, cpred_target_pl) / 3.0 + \
-    #                         criterion_seg(apred_target_aug, apred_target_pl) / 3.0 + \
-    #                         criterion_seg(dpred_target_aug, dpred_target_pl) / 3.0
-    #         loss_consist_pl = loss_consist_pl * weight_consist_pl
-    #         loss_total += loss_consist_pl
-    #         sum_loss_consist_pl += loss_consist_pl.item()
-    #     else:
-    #         sum_loss_consist_pl = 0.0
-    #
-    #     # warp loss
-    #     if cfg.TRAIN.warp_loss:
-    #         loss_warp_c, loss_warp_a = cross_supervision(cpred_target_aug, apred_target_aug, dpred_target_aug, criterion_seg)
-    #         loss_warp = (loss_warp_c + loss_warp_a) / 2.0
-    #         loss_warp = loss_warp * weight_warp
-    #         loss_total += loss_warp
-    #         sum_loss_warp_target += loss_warp.item()
-    #     else:
-    #         sum_loss_warp_target = 0.0
-    #     loss_total.backward()
-    #     sum_loss_total += loss_total.item()
-    #
-    #     # torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
-    #
-    #     optimizer.step()
-    #     learning_rate = optimizer.param_groups[0]['lr']
-    #
-    #     sum_time += time.time() - t1
-    #
-    #     # log train
-    #     if iters % cfg.TRAIN.display_freq == 0 or iters == 1:
-    #         rcd_time.append(sum_time)
-    #         if iters == 1:
-    #             logging.info('step %d, loss=%.6f, loss_sup=%.6f, loss_fa=%.6f, '
-    #                          'loss_proto=%.6f, loss_fea=%.6f, loss_pl=%.6f, loss_warp=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)'
-    #                         % (iters, sum_loss_total, sum_loss_supervised, sum_loss_fa, sum_loss_proto_pred, sum_loss_consist_fea, sum_loss_consist_pl, sum_loss_warp_target, learning_rate, sum_time,
-    #                         (cfg.TRAIN.total_iters - iters) / cfg.TRAIN.display_freq * np.mean(np.asarray(rcd_time)) / 60))
-    #         else:
-    #             logging.info('step %d, loss=%.6f, loss_sup=%.6f, loss_fa=%.6f, loss_proto=%.6f, loss_fea=%.6f, loss_pl=%.6f, loss_warp=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)'
-    #                         % (iters, \
-    #                             sum_loss_total / cfg.TRAIN.display_freq, \
-    #                             sum_loss_supervised / cfg.TRAIN.display_freq, \
-    #                             sum_loss_fa / cfg.TRAIN.display_freq, \
-    #                             sum_loss_proto_pred / cfg.TRAIN.display_freq, \
-    #                             sum_loss_consist_fea / cfg.TRAIN.display_freq, \
-    #                             sum_loss_consist_pl / cfg.TRAIN.display_freq, \
-    #                             sum_loss_warp_target / cfg.TRAIN.display_freq, learning_rate, sum_time, \
-    #                         (cfg.TRAIN.total_iters - iters) / cfg.TRAIN.display_freq * np.mean(np.asarray(rcd_time)) / 60))
-    #             writer.add_scalar('loss_sup', sum_loss_supervised / cfg.TRAIN.display_freq, iters)
-    #             writer.add_scalar('loss_fa', sum_loss_fa / cfg.TRAIN.display_freq, iters)
-    #             writer.add_scalar('loss_proto_pred', sum_loss_proto_pred / cfg.TRAIN.display_freq, iters)
-    #             writer.add_scalar('loss_consist_fea', sum_loss_consist_fea / cfg.TRAIN.display_freq, iters)
-    #             writer.add_scalar('loss_consist_pl', sum_loss_consist_pl / cfg.TRAIN.display_freq, iters)
-    #             writer.add_scalar('loss_warp_target', sum_loss_warp_target / cfg.TRAIN.display_freq, iters)
-    #             writer.add_scalar('loss_total', sum_loss_total / cfg.TRAIN.display_freq, iters)
-    #             f_loss_txt.write('step=%d, loss=%.6f, loss_sup=%.6f, loss_fa=%.6f, loss_proto=%.6f, loss_fea=%.6f, loss_pl=%.6f, loss_warp=%.6f' % \
-    #                 (iters, sum_loss_total / cfg.TRAIN.display_freq, \
-    #                             sum_loss_supervised / cfg.TRAIN.display_freq, \
-    #                             sum_loss_fa / cfg.TRAIN.display_freq, \
-    #                             sum_loss_proto_pred / cfg.TRAIN.display_freq, \
-    #                             sum_loss_consist_fea / cfg.TRAIN.display_freq, \
-    #                             sum_loss_consist_pl / cfg.TRAIN.display_freq, \
-    #                             sum_loss_warp_target / cfg.TRAIN.display_freq))
-    #             f_loss_txt.write('\n')
-    #             f_loss_txt.flush()
-    #             sys.stdout.flush()
-    #             sum_time = 0.0
-    #             sum_loss_total = 0.0
-    #             sum_loss_supervised = 0.0
-    #             sum_loss_fa = 0.0
-    #             sum_loss_proto_pred = 0.0
-    #             sum_loss_consist_fea = 0.0
-    #             sum_loss_consist_pl = 0.0
-    #             sum_loss_warp_target = 0.0
-    #
-    #     # display
-    #     if iters % cfg.TRAIN.show_freq == 0 or iters == 1:
-    #         if proto_pred_c is None:
-    #             temp = cpred_target_aug[0]
-    #         else:
-    #             temp = proto_pred_c[0]
-    #         show_training2(iters, cimg_source[0], clabel_source[0], cpred_source[0], \
-    #                     cimg_target_aug[0], cpred_target_aug[0], temp, \
-    #                     cimg_target[0], cpred_target[0], cpred_target_pl[0], cfg.cache_path, tag='c')
-    #         # show_training(iters, aimg_source[0], alabel_source[0], apred_source[0], cfg.cache_path, tag='a')
-    #         # show_training(iters, cimg_source[0], dlabel_source[0], dpred_source[0], cfg.cache_path, tag='d')
-    #
-    #     # valid
-    #     if cfg.TRAIN.if_valid:
-    #         if iters % cfg.TRAIN.valid_freq == 0 or iters == 1:
-    #             model.eval()
-    #             preds = np.zeros((165, 768, 1024), dtype=np.uint8)
-    #             for i_pic, (cimg, _, aimg, _, _) in enumerate(valid_provider):
-    #                 cimg = cimg.to(device)
-    #                 aimg = aimg.to(device)
-    #                 img_cat = torch.cat([cimg, aimg], dim=1)
-    #                 with torch.no_grad():
-    #                     cpred, apred, _, _, _, _ = model(img_cat)
-    #                 preds[i_pic] = inference_results(cpred, preds[i_pic])
-    #                 preds[i_pic+target_stride] = inference_results(apred, preds[i_pic+target_stride])
-    #             F1 = target_evaluation(preds)
-    #             logging.info('model-%d, f1=%.6f' % (iters, F1))
-    #             writer.add_scalar('valid/F1', F1, iters)
-    #             f_valid_txt.write('model-%d, F1=%.6f' % (iters, F1))
-    #             f_valid_txt.write('\n')
-    #             f_valid_txt.flush()
-    #             torch.cuda.empty_cache()
-    #     # save
-    #     if iters % cfg.TRAIN.save_freq == 0:
-    #         states = {'current_iter': iters, 'valid_result': None,
-    #                 'model_weights': model.state_dict()}
-    #         torch.save(states, os.path.join(cfg.save_path, 'model-%06d.ckpt' % iters))
-    #         print('***************save modol, iters = %d.***************' % (iters), flush=True)
-    # f_loss_txt.close()
-    # f_valid_txt.close()
+        # consistent feature loss
+        if cfg.TRAIN.consist_fea_loss:
+            loss_consist_fea = criterion_con(fea_tatget_aug_c, fea_tatget_c) / 3.0 + \
+                            criterion_con(fea_tatget_aug_a, fea_tatget_a) / 3.0 + \
+                            criterion_con(fea_tatget_aug_d, fea_tatget_d) / 3.0
+            loss_consist_fea = loss_consist_fea * weight_consist_fea
+            loss_total += loss_consist_fea
+            sum_loss_consist_fea += loss_consist_fea.item()
+        else:
+            sum_loss_consist_fea = 0.0
+
+        # consistent pseudo label loss
+        if cfg.TRAIN.consist_pl_loss:
+            loss_consist_pl = criterion_seg(cpred_target_aug, cpred_target_pl) / 3.0 + \
+                            criterion_seg(apred_target_aug, apred_target_pl) / 3.0 + \
+                            criterion_seg(dpred_target_aug, dpred_target_pl) / 3.0
+            loss_consist_pl = loss_consist_pl * weight_consist_pl
+            loss_total += loss_consist_pl
+            sum_loss_consist_pl += loss_consist_pl.item()
+        else:
+            sum_loss_consist_pl = 0.0
+
+        # warp loss
+        if cfg.TRAIN.warp_loss:
+            loss_warp_c, loss_warp_a = cross_supervision(cpred_target_aug, apred_target_aug, dpred_target_aug, criterion_seg)
+            loss_warp = (loss_warp_c + loss_warp_a) / 2.0
+            loss_warp = loss_warp * weight_warp
+            loss_total += loss_warp
+            sum_loss_warp_target += loss_warp.item()
+        else:
+            sum_loss_warp_target = 0.0
+        loss_total.backward()
+        sum_loss_total += loss_total.item()
+        
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+        
+        optimizer.step()
+        learning_rate = optimizer.param_groups[0]['lr']
+        
+        sum_time += time.time() - t1
+
+        # log train
+        if iters % cfg.TRAIN.display_freq == 0 or iters == 1:
+            rcd_time.append(sum_time)
+            if iters == 1:
+                logging.info('step %d, loss=%.6f, loss_sup=%.6f, loss_fa=%.6f, '
+                             'loss_proto=%.6f, loss_fea=%.6f, loss_pl=%.6f, loss_warp=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)'
+                            % (iters, sum_loss_total, sum_loss_supervised, sum_loss_fa, sum_loss_proto_pred, sum_loss_consist_fea, sum_loss_consist_pl, sum_loss_warp_target, learning_rate, sum_time,
+                            (cfg.TRAIN.total_iters - iters) / cfg.TRAIN.display_freq * np.mean(np.asarray(rcd_time)) / 60))
+            else:
+                logging.info('step %d, loss=%.6f, loss_sup=%.6f, loss_fa=%.6f, loss_proto=%.6f, loss_fea=%.6f, loss_pl=%.6f, loss_warp=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)'
+                            % (iters, \
+                                sum_loss_total / cfg.TRAIN.display_freq, \
+                                sum_loss_supervised / cfg.TRAIN.display_freq, \
+                                sum_loss_fa / cfg.TRAIN.display_freq, \
+                                sum_loss_proto_pred / cfg.TRAIN.display_freq, \
+                                sum_loss_consist_fea / cfg.TRAIN.display_freq, \
+                                sum_loss_consist_pl / cfg.TRAIN.display_freq, \
+                                sum_loss_warp_target / cfg.TRAIN.display_freq, learning_rate, sum_time, \
+                            (cfg.TRAIN.total_iters - iters) / cfg.TRAIN.display_freq * np.mean(np.asarray(rcd_time)) / 60))
+                writer.add_scalar('loss_sup', sum_loss_supervised / cfg.TRAIN.display_freq, iters)
+                writer.add_scalar('loss_fa', sum_loss_fa / cfg.TRAIN.display_freq, iters)
+                writer.add_scalar('loss_proto_pred', sum_loss_proto_pred / cfg.TRAIN.display_freq, iters)
+                writer.add_scalar('loss_consist_fea', sum_loss_consist_fea / cfg.TRAIN.display_freq, iters)
+                writer.add_scalar('loss_consist_pl', sum_loss_consist_pl / cfg.TRAIN.display_freq, iters)
+                writer.add_scalar('loss_warp_target', sum_loss_warp_target / cfg.TRAIN.display_freq, iters)
+                writer.add_scalar('loss_total', sum_loss_total / cfg.TRAIN.display_freq, iters)
+                f_loss_txt.write('step=%d, loss=%.6f, loss_sup=%.6f, loss_fa=%.6f, loss_proto=%.6f, loss_fea=%.6f, loss_pl=%.6f, loss_warp=%.6f' % \
+                    (iters, sum_loss_total / cfg.TRAIN.display_freq, \
+                                sum_loss_supervised / cfg.TRAIN.display_freq, \
+                                sum_loss_fa / cfg.TRAIN.display_freq, \
+                                sum_loss_proto_pred / cfg.TRAIN.display_freq, \
+                                sum_loss_consist_fea / cfg.TRAIN.display_freq, \
+                                sum_loss_consist_pl / cfg.TRAIN.display_freq, \
+                                sum_loss_warp_target / cfg.TRAIN.display_freq))
+                f_loss_txt.write('\n')
+                f_loss_txt.flush()
+                sys.stdout.flush()
+                sum_time = 0.0
+                sum_loss_total = 0.0
+                sum_loss_supervised = 0.0
+                sum_loss_fa = 0.0
+                sum_loss_proto_pred = 0.0
+                sum_loss_consist_fea = 0.0
+                sum_loss_consist_pl = 0.0
+                sum_loss_warp_target = 0.0
+        
+        # display
+        if iters % cfg.TRAIN.show_freq == 0 or iters == 1:
+            if proto_pred_c is None:
+                temp = cpred_target_aug[0]
+            else:
+                temp = proto_pred_c[0]
+            show_training2(iters, cimg_source[0], clabel_source[0], cpred_source[0], \
+                        cimg_target_aug[0], cpred_target_aug[0], temp, \
+                        cimg_target[0], cpred_target[0], cpred_target_pl[0], cfg.cache_path, tag='c')
+            # show_training(iters, aimg_source[0], alabel_source[0], apred_source[0], cfg.cache_path, tag='a')
+            # show_training(iters, cimg_source[0], dlabel_source[0], dpred_source[0], cfg.cache_path, tag='d')
+
+        # valid
+        if cfg.TRAIN.if_valid:
+            if iters % cfg.TRAIN.valid_freq == 0 or iters == 1:
+                model.eval()
+                preds = np.zeros((165, 768, 1024), dtype=np.uint8)
+                for i_pic, (cimg, _, aimg, _, _) in enumerate(valid_provider):
+                    cimg = cimg.to(device)
+                    aimg = aimg.to(device)
+                    img_cat = torch.cat([cimg, aimg], dim=1)
+                    with torch.no_grad():
+                        cpred, apred, _, _, _, _ = model(img_cat)
+                    preds[i_pic] = inference_results(cpred, preds[i_pic])
+                    preds[i_pic+target_stride] = inference_results(apred, preds[i_pic+target_stride])
+
+                F1 = target_evaluation(preds, mode='F1')
+                logging.info('model-%d, F1=%.6f' % (iters, F1))
+                # logging.info('model-%d, jac=%.6f' % (iters, jac_avg))
+                writer.add_scalar('valid/F1', F1, iters)
+                # writer.add_scalar('valid/jac', jac_avg, iters)
+                f_valid_txt.write('model-%d, F1=%.6f' % (iters, F1))
+
+                # dice_avg, jac_avg = target_evaluation(preds)
+                # logging.info('model-%d, dice=%.6f' % (iters, dice_avg))
+                # logging.info('model-%d, jac=%.6f' % (iters, jac_avg))
+                # writer.add_scalar('valid/dice', dice_avg, iters)
+                # writer.add_scalar('valid/jac', jac_avg, iters)
+                # f_valid_txt.write('model-%d, dice=%.6f, jac=%.6f' % (iters, dice_avg, jac_avg))
+
+                f_valid_txt.write('\n')
+                f_valid_txt.flush()
+                torch.cuda.empty_cache()
+        # save
+        if iters % cfg.TRAIN.save_freq == 0:
+            states = {'current_iter': iters, 'valid_result': None,
+                    'model_weights': model.state_dict()}
+            torch.save(states, os.path.join(cfg.save_path, 'model-%06d.ckpt' % iters))
+            print('***************save modol, iters = %d.***************' % (iters), flush=True)
+    f_loss_txt.close()
+    f_valid_txt.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
