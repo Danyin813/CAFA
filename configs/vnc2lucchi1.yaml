@@ -1,0 +1,68 @@
+NAME: 'lucchi_subset1_fa3'
+
+MODEL:
+    input_nc: 1
+    output_nc: 2
+    num_classes: 2
+    input_channels: 64
+    level: 1
+
+TRAIN:
+    resume: False
+    model_name: ''
+    if_valid: True
+    cache_path: '/braindat/lab/yd/august/code/experiment/class-aware/caches/'
+    save_path: '/braindat/lab/yd/august/code/experiment/class-aware/models/'
+    log_path: '/braindat/lab/yd/august/code/experiment/class-aware/logs/'
+    valid_path: '/braindat/lab/yd/august/code/experiment/class-aware/valid/'
+    cross_loss_source: False
+    feature_align: True
+    proto_pred_loss: True
+    consist_fea_loss: True
+    consist_pl_loss: True
+    warp_loss: False
+    weight_fa: 0.1
+    weight_proto_pred: 0.1
+    weight_consist_fea: 0.1
+    weight_consist_pl: 0.1
+    weight_warp: 0.1
+    threshold: 0.7
+    consistency_weight_rampup: True
+
+    opt_type: 'adam'  # sgd
+    lr_mode: 'fixed'
+    total_iters: 200000
+    rampup_iters: 50000
+    learning_rate: 0.0001
+    display_freq: 100
+    show_freq: 100
+    valid_freq: 1000
+    save_freq: 1000
+    power: 0.9
+
+    batch_size: 1
+    num_workers: 4
+    if_cuda: True
+
+    random_seed: 666  # -1 is none
+
+DATA:
+    data_dir_img: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/VNC3/training/'
+    data_dir_label: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/VNC3/training_groundtruth/'
+    data_list: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/VNC3/train.txt'
+    input_size: 512
+    source_stride: 1
+    strong_aug_source: True
+    data_dir_target: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/Lucchi/training'
+    data_dir_target_label: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/Lucchi/training_groundtruth'
+    data_list_target: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/Lucchi/train.txt'
+    input_size_target: 512
+    target_stride: 10
+    strong_aug_target: True
+    data_dir_val: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/Lucchi/testing'
+    data_dir_val_label: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/Lucchi/testing_groundtruth'
+    data_list_val: '/braindat/lab/yd/august/expriments/DA_Mito_yindan/data/Lucchi/testing.txt'
+
+TEST:
+    pad: 0
+    model_name: ''

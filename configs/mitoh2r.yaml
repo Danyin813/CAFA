@@ -1,0 +1,69 @@
+NAME: 'mito_h2r_fa3'
+
+MODEL:
+    input_nc: 1
+    output_nc: 2
+    num_classes: 2
+    input_channels: 64
+    level: 1
+
+TRAIN:
+    resume: False
+    model_name: ''
+    if_valid: True
+    cache_path: '../caches/'
+    save_path: '../models/'
+    log_path: '../logs/'
+    valid_path: '../valid/'
+    cross_loss_source: False
+    feature_align: True
+    proto_pred_loss: True
+    consist_fea_loss: True
+    consist_pl_loss: True
+    warp_loss: True
+    weight_fa: 0.1
+    weight_proto_pred: 0.1
+    weight_consist_fea: 0.1
+    weight_consist_pl: 0.1
+    weight_warp: 0.1
+    threshold: 0.7
+    consistency_weight_rampup: True
+
+    opt_type: 'adam'  # sgd
+    lr_mode: 'fixed'
+    total_iters: 200000
+    rampup_iters: 50000
+    learning_rate: 0.0001
+    display_freq: 100
+    show_freq: 100
+    valid_freq: 1000
+    save_freq: 1000
+    power: 0.9
+
+    batch_size: 2
+    num_workers: 4
+    if_cuda: True
+
+    random_seed: 666  # -1 is none
+
+DATA:
+    data_dir_img: '/data/August/mitoem-h/training.hdf'
+    data_dir_label: '/data/August/mitoem-h/training_groundtruth.hdf'
+    data_list: ~
+    input_size: 512
+    source_stride: 1
+    strong_aug_source: True
+    data_dir_target: '/data/August/mitoem-r/training.hdf'
+    data_dir_target_label: '/data/August/mitoem-r/training_groundtruth.hdf'
+    data_list_target: ~
+    input_size_target: 512
+    target_stride: 1
+    strong_aug_target: True
+    data_dir_val: '/data/August/mitoem-r/testing.hdf'
+    data_dir_val_label: '/data/August/mitoem-r/testing_groundtruth.hdf'
+    data_list_val: ~
+    input_size_test: 1024
+
+TEST:
+    pad: 0
+    model_name: ''
